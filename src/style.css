@@ -312,6 +312,12 @@ input:focus {
   font-size: 0.8125rem;
   cursor: pointer;
   transition: var(--transition);
+  max-width: 200px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  display: inline-block;
+  vertical-align: middle;
 }
 
 .chip.active {
@@ -736,4 +742,142 @@ input:focus {
 
 .modal-close:hover {
   color: var(--text-main);
+}
+
+/* Sidebar & Layout Fix */
+.app-layout {
+  display: flex;
+  flex: 1;
+  height: calc(100vh - 80px);
+}
+
+.sidebar {
+  width: 260px;
+  background: var(--bg-surface);
+  border-right: 1px solid var(--border-subtle);
+  display: flex;
+  flex-direction: column;
+  padding: 1.5rem 1rem;
+  gap: 0.5rem;
+}
+
+.nav-item {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.875rem 1rem;
+  border-radius: var(--radius-sm);
+  color: var(--text-muted);
+  text-decoration: none;
+  font-weight: 500;
+  cursor: pointer;
+  transition: var(--transition);
+}
+
+.nav-item:hover {
+  background: var(--bg-elevated);
+  color: var(--text-main);
+}
+
+.nav-item.active {
+  background: var(--primary-glow);
+  color: var(--primary);
+  border: 1px solid var(--primary-glow);
+}
+
+.main-content {
+  flex: 1;
+  overflow-y: auto;
+  position: relative;
+}
+
+/* Cloudflare Components */
+.cf-accounts-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+  gap: 1.5rem;
+  margin-bottom: 2.5rem;
+}
+
+.cf-account-card {
+  padding: 1.5rem;
+  position: relative;
+}
+
+.cf-account-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  margin-bottom: 1.5rem;
+}
+
+.cf-badge {
+  background: #f38020;
+  color: white;
+  padding: 0.2rem 0.6rem;
+  font-size: 0.7rem;
+  border-radius: 4px;
+  font-weight: 800;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.domain-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.domain-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.75rem 1rem;
+  background: var(--bg-deep);
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-subtle);
+  transition: var(--transition);
+}
+
+.domain-item:hover {
+  border-color: var(--warning);
+}
+
+.domain-status {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+}
+
+.domain-active {
+  background: var(--success);
+  box-shadow: 0 0 8px var(--success);
+}
+
+.domain-pending {
+  background: var(--warning);
+  box-shadow: 0 0 8px var(--warning);
+}
+
+.account-actions {
+  display: flex;
+  gap: 0.5rem;
+  margin-top: 1.5rem;
+  padding-top: 1rem;
+  border-top: 1px solid var(--border-subtle);
+}
+
+/* Responsive Fix */
+@media (max-width: 768px) {
+  .app-layout {
+    flex-direction: column;
+  }
+
+  .sidebar {
+    width: 100%;
+    height: auto;
+    flex-direction: row;
+    overflow-x: auto;
+  }
 }

@@ -12,6 +12,13 @@ const state = {
   ownerFilter: 'all',
   sortBy: 'updated',
   loading: false,
+  activeView: 'github', // 'github', 'cf-domains', 'cf-accounts'
+  cfAccounts: JSON.parse(localStorage.getItem('cf_accounts')) || [],
+  cfZones: {}, // { accountId: [zones] }
+  cfAccountFilter: 'all',
+  cfRealAccountFilter: 'all', // Filter by real CF account name/id
+  activeZone: null, // { zoneId, zoneName, account }
+  cfDnsRecords: {}, // { zoneId: [records] }
 }
 
 // GitHub API Client
@@ -109,6 +116,55 @@ const github = {
   }
 }
 
+// Cloudflare API Client
+const cloudflare = {
+  async request(account, endpoint, options = {}) {
+    const response = await fetch(`/cf-api${endpoint}`, {
+      ...options,
+      headers: {
+        'X-Auth-Email': account.email,
+        'X-Auth-Key': account.key,
+        'Content-Type': 'application/json',
+        ...options.headers,
+      },
+    })
+    const data = await response.json()
+    if (!data.success) {
+      throw new Error(data.errors?.[0]?.message || 'Cloudflare API request failed')
+    }
+    return data.result
+  },
+
+  async fetchZones(account) {
+    // Fetch zones across all accounts the user has access to
+    return this.request(account, '/zones?per_page=100&status=active,pending')
+  },
+
+  async fetchDnsRecords(account, zoneId) {
+    return this.request(account, `/zones/${zoneId}/dns_records?per_page=100`)
+  },
+
+  async createDnsRecord(account, zoneId, data) {
+    return this.request(account, `/zones/${zoneId}/dns_records`, {
+      method: 'POST',
+      body: JSON.stringify(data)
+    })
+  },
+
+  async updateDnsRecord(account, zoneId, recordId, data) {
+    return this.request(account, `/zones/${zoneId}/dns_records/${recordId}`, {
+      method: 'PATCH',
+      body: JSON.stringify(data)
+    })
+  },
+
+  async deleteDnsRecord(account, zoneId, recordId) {
+    return this.request(account, `/zones/${zoneId}/dns_records/${recordId}`, {
+      method: 'DELETE'
+    })
+  }
+}
+
 // Helper: Filter and Sort Repos
 function getProcessedRepos() {
   return state.repos
@@ -142,6 +198,9 @@ async function init() {
       state.user = await github.fetchUser()
       state.repos = await github.fetchRepos()
       fetchAllStats() // Background fetch stats
+      if (state.cfAccounts.length > 0) {
+        fetchAllCfZones()
+      }
     } catch (err) {
       console.error(err)
       state.token = null
@@ -439,6 +498,360 @@ function Dashboard() {
   `
 }
 
+function CloudflareAccountsView() {
+  return `
+    <main class="container">
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 2.5rem;">
+        <div>
+          <h1 style="font-size: 2.5rem; margin-bottom: 0.5rem;">CF Accounts</h1>
+          <p style="color: var(--text-dim);">Manage your Cloudflare identities and API keys.</p>
+        </div>
+        <button class="btn btn-primary" id="add-cf-account-btn">
+          <i data-lucide="plus-circle"></i> Add Account
+        </button>
+      </div>
+
+      ${state.cfAccounts.length === 0 ? `
+        <div class="glass-panel" style="padding: 4rem; text-align: center;">
+          <i data-lucide="user-plus" style="width: 48px; height: 48px; color: var(--text-dim); margin-bottom: 1.5rem;"></i>
+          <h3>No Cloudflare Accounts</h3>
+          <p style="color: var(--text-dim); margin-top: 0.5rem;">Add your first account to start managing domains.</p>
+        </div>
+      ` : `
+        <div class="cf-accounts-grid">
+          ${state.cfAccounts.map(acc => `
+            <div class="cf-account-card glass-panel" style="display: flex; flex-direction: column; justify-content: space-between;">
+              <div class="cf-account-header">
+                <div>
+                  <div class="cf-badge"><i data-lucide="shield"></i> Account</div>
+                  <h3 style="margin-top: 0.75rem;">${acc.name || acc.email}</h3>
+                  <div style="font-size: 0.8rem; color: var(--text-dim); margin-top: 0.25rem;">${acc.email}</div>
+                </div>
+                <button class="btn-icon danger remove-cf-acc" data-id="${acc.id}">
+                  <i data-lucide="trash-2"></i>
+                </button>
+              </div>
+              
+              <div style="margin-top: 1rem; padding: 1rem; background: var(--bg-deep); border-radius: 8px; font-family: var(--font-mono); font-size: 0.75rem; color: var(--text-muted); border: 1px solid var(--border-subtle);">
+                Key: ••••••••••••••••${acc.key.slice(-4)}
+              </div>
+            </div>
+          `).join('')}
+        </div>
+      `}
+
+      <!-- Add Account Modal -->
+      <div class="modal-overlay" id="cf-modal-overlay">
+        <div class="modal glass-panel">
+          <button class="modal-close" id="close-cf-modal-btn">
+            <i data-lucide="x"></i>
+          </button>
+          <h2 style="margin-bottom: 0.5rem;">Add Cloudflare Account</h2>
+          <p style="color: var(--text-dim); font-size: 0.875rem; margin-bottom: 2rem;">Use your Global API Key for full access.</p>
+          
+          <div class="input-group">
+            <label>Custom Name (optional)</label>
+            <input type="text" id="cf-acc-name" placeholder="Work Account / Personal">
+          </div>
+
+          <div class="input-group">
+            <label>Cloudflare Email</label>
+            <input type="email" id="cf-acc-email" placeholder="user@example.com">
+          </div>
+          
+          <div class="input-group">
+            <label>Global API Key</label>
+            <input type="password" id="cf-acc-key" placeholder="Paste your key here">
+          </div>
+
+          <button class="btn btn-primary" id="save-cf-account-btn" style="width: 100%; margin-top: 1rem;">
+            Save Account
+          </button>
+        </div>
+      </div>
+    </main>
+  `
+}
+
+function CloudflareDomainsView() {
+  const allZones = []
+  const uniqueRealAccounts = new Map() // { id: name }
+
+  Object.entries(state.cfZones).forEach(([accId, zones]) => {
+    const localCredential = state.cfAccounts.find(a => a.id === accId)
+    zones.forEach(z => {
+      allZones.push({ ...z, localAccount: localCredential })
+      if (z.account && z.account.id) {
+        uniqueRealAccounts.set(z.account.id, z.account.name)
+      }
+    })
+  })
+
+  const searchQuery = state.searchQuery || ''
+  const filteredZones = allZones.filter(z => {
+    const matchesSearch = z.name.toLowerCase().includes(searchQuery.toLowerCase())
+    const matchesCredential = state.cfAccountFilter === 'all' || (z.localAccount && z.localAccount.id === state.cfAccountFilter)
+    const matchesRealAccount = state.cfRealAccountFilter === 'all' || (z.account && z.account.id === state.cfRealAccountFilter)
+    return matchesSearch && matchesCredential && matchesRealAccount
+  })
+
+  return `
+    <main class="container">
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 2.5rem;">
+        <div>
+          <h1 style="font-size: 2.5rem; margin-bottom: 0.5rem;">CF Domains</h1>
+          <p style="color: var(--text-dim);">Aggregated list from all your Cloudflare accounts and memberships.</p>
+        </div>
+      </div>
+
+      <div class="toolbar" style="margin-bottom: 1.5rem;">
+        <div class="search-box">
+          <i data-lucide="search"></i>
+          <input type="text" id="cf-domain-search" placeholder="Search domains..." value="${searchQuery}">
+        </div>
+      </div>
+
+      <div class="filter-section glass-panel" style="padding: 1rem; margin-bottom: 2rem; border-color: var(--border-subtle);">
+        <div class="quick-filters" style="margin-bottom: 1rem;">
+          <div style="font-size: 0.75rem; color: var(--text-dim); display: flex; align-items: center; min-width: 80px;">
+            <i data-lucide="key" style="width: 14px; margin-right: 6px;"></i> API:
+          </div>
+          <div class="chip ${state.cfAccountFilter === 'all' ? 'active' : ''}" data-cf-filter="all">All</div>
+          ${state.cfAccounts.map(acc => `
+            <div class="chip ${state.cfAccountFilter === acc.id ? 'active' : ''}" data-cf-filter="${acc.id}" title="${acc.name}">${acc.name}</div>
+          `).join('')}
+        </div>
+
+        <div class="quick-filters">
+          <div style="font-size: 0.75rem; color: var(--text-dim); display: flex; align-items: center; min-width: 80px;">
+            <i data-lucide="building" style="width: 14px; margin-right: 6px;"></i> Org:
+          </div>
+          <div class="chip ${state.cfRealAccountFilter === 'all' ? 'active' : ''}" data-cf-real-filter="all">All Orgs</div>
+          ${Array.from(uniqueRealAccounts.entries()).map(([id, name]) => {
+    const shortName = name.replace(/'s Account$/i, '')
+    return `
+              <div class="chip ${state.cfRealAccountFilter === id ? 'active' : ''}" data-cf-real-filter="${id}" title="${name}">${shortName}</div>
+            `
+  }).join('')}
+        </div>
+      </div>
+
+      ${allZones.length === 0 ? `
+        <div class="glass-panel" style="padding: 4rem; text-align: center;">
+          <i data-lucide="cloud-off" style="width: 48px; height: 48px; color: var(--text-dim); margin-bottom: 1.5rem;"></i>
+          <h3>No Domains Found</h3>
+          <p style="color: var(--text-dim); margin-top: 0.5rem;">Try adding a credential or refreshing the page.</p>
+        </div>
+      ` : `
+        <div class="repo-list">
+          ${filteredZones.length === 0 ? `
+            <div style="padding: 3rem; text-align: center; color: var(--text-dim);">No domains match your filters.</div>
+          ` : filteredZones.map(zone => `
+            <div class="repo-list-item glass-panel" style="padding: 1.25rem 2rem;">
+              <div style="display: flex; align-items: center; gap: 1.5rem; flex: 1;">
+                <span class="domain-status ${zone.status === 'active' ? 'domain-active' : 'domain-pending'}"></span>
+                <div style="flex: 1;">
+                  <div style="font-weight: 600; font-size: 1.1rem; color: var(--primary);">${zone.name}</div>
+                  <div style="font-size: 0.8rem; color: var(--text-dim); margin-top: 0.25rem; display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap;">
+                    <span>Account:</span>
+                    <span style="color: var(--warning); font-weight: 600;" title="${zone.account.name}">${zone.account.name.replace(/'s Account$/i, '')}</span>
+                    <span style="opacity: 0.5;">•</span>
+                    <span style="font-size: 0.75rem;">Status: ${zone.status}</span>
+                    ${zone.localAccount ? `
+                      <span style="opacity: 0.5;">•</span>
+                      <span style="font-size: 0.7rem; background: var(--bg-elevated); padding: 1px 6px; border-radius: 4px; border: 1px solid var(--border-subtle);">via ${zone.localAccount.name}</span>
+                    ` : ''}
+                  </div>
+                </div>
+                <div class="repo-actions" style="border: none; margin: 0; padding: 0;">
+                  <button class="btn-icon view-dns-btn" data-zone-id="${zone.id}" data-zone-name="${zone.name}" data-acc-id="${zone.localAccount.id}" title="Manage DNS Records">
+                    <i data-lucide="list"></i>
+                  </button>
+                  <a href="https://dash.cloudflare.com/${zone.account.id}/${zone.name}" target="_blank" class="btn-icon" title="Open in Cloudflare">
+                    <i data-lucide="external-link"></i>
+                  </a>
+                </div>
+              </div>
+            </div>
+          `).join('')}
+        </div>
+      `}
+    </main>
+  `
+}
+
+function CloudflareDnsView() {
+  const { zoneId, zoneName, localAccount } = state.activeZone
+  const records = state.cfDnsRecords[zoneId] || []
+  const searchQuery = state.searchQuery || ''
+  const filteredRecords = records.filter(r =>
+    r.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
+    r.content.toLowerCase().includes(searchQuery.toLowerCase()) ||
+    r.type.toLowerCase().includes(searchQuery.toLowerCase())
+  )
+
+  return `
+    <main class="container">
+      <div style="display: flex; align-items: center; gap: 1rem; margin-bottom: 2rem;">
+        <button class="btn-icon" id="back-to-domains" title="Back to Domains">
+          <i data-lucide="arrow-left"></i>
+        </button>
+        <div>
+          <h1 style="font-size: 2rem; margin-bottom: 0.25rem;">${zoneName}</h1>
+          <p style="color: var(--text-dim); font-size: 0.875rem;">
+            DNS Records • <span style="color: var(--warning)">${localAccount.name}</span>
+          </p>
+        </div>
+      </div>
+
+      <div class="toolbar" style="margin-bottom: 2rem;">
+        <div class="search-box">
+          <i data-lucide="search"></i>
+          <input type="text" id="dns-search" placeholder="Search DNS records..." value="${searchQuery}">
+        </div>
+        <div class="filter-group">
+           <button class="btn btn-outline" id="refresh-dns-btn">
+            <i data-lucide="refresh-cw"></i>
+          </button>
+          <button class="btn btn-primary" id="add-dns-record-btn">
+            <i data-lucide="plus"></i> Add Record
+          </button>
+        </div>
+      </div>
+
+      ${records.length === 0 ? `
+        <div class="glass-panel" style="padding: 4rem; text-align: center;">
+          <p style="color: var(--text-dim);">No DNS records found.</p>
+        </div>
+      ` : `
+        <div class="repo-list">
+          ${filteredRecords.map(record => `
+            <div class="repo-list-item glass-panel" style="padding: 1rem 1.5rem; gap: 1rem;">
+              <div style="width: 60px; font-weight: 800; color: var(--primary); font-size: 0.75rem; background: var(--bg-elevated); padding: 4px 8px; border-radius: 4px; text-align: center; border: 1px solid var(--border-subtle);">
+                ${record.type}
+              </div>
+              <div style="flex: 1; min-width: 0;">
+                <div style="font-weight: 600; font-family: var(--font-mono); font-size: 0.9rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">
+                  ${record.name}
+                </div>
+                <div style="font-size: 0.8rem; color: var(--text-dim); font-family: var(--font-mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-top: 0.25rem;">
+                  ${record.content}
+                </div>
+              </div>
+              <div style="display: flex; align-items: center; gap: 1.5rem; font-size: 0.75rem; color: var(--text-dim);">
+                <div title="Proxied Status" style="display: flex; align-items: center; gap: 4px;">
+                  <i data-lucide="${record.proxied ? 'cloud' : 'cloud-off'}" style="width: 14px; color: ${record.proxied ? '#f38020' : 'inherit'}"></i>
+                  ${record.proxied ? 'Proxied' : 'DNS Only'}
+                </div>
+                <div title="TTL" style="display: flex; align-items: center; gap: 4px;">
+                  <i data-lucide="clock" style="width: 12px;"></i> ${record.ttl === 1 ? 'Auto' : record.ttl}
+                </div>
+              </div>
+              <div class="repo-actions" style="border: none; margin: 0; padding: 0;">
+                <button class="btn-icon edit-dns-btn" 
+                  data-id="${record.id}" 
+                  data-type="${record.type}" 
+                  data-name="${record.name}" 
+                  data-content="${record.content}" 
+                  data-proxied="${record.proxied}" 
+                  data-ttl="${record.ttl}"
+                >
+                  <i data-lucide="edit-3"></i>
+                </button>
+                <button class="btn-icon danger delete-dns-btn" data-id="${record.id}" data-name="${record.name}">
+                  <i data-lucide="trash-2"></i>
+                </button>
+              </div>
+            </div>
+          `).join('')}
+        </div>
+      `}
+
+      <!-- DNS Modal -->
+      <div class="modal-overlay" id="dns-modal-overlay">
+        <div class="modal glass-panel">
+          <button class="modal-close" id="close-dns-modal-btn">
+            <i data-lucide="x"></i>
+          </button>
+          <h2 id="dns-modal-title" style="margin-bottom: 0.5rem;">Add DNS Record</h2>
+          <p style="color: var(--text-dim); font-size: 0.875rem; margin-bottom: 2rem;">Configure your domain routing.</p>
+          
+          <input type="hidden" id="dns-record-id">
+
+          <div style="display: grid; grid-template-columns: 100px 1fr; gap: 1rem;">
+            <div class="input-group">
+              <label>Type</label>
+              <select class="select-custom" id="dns-record-type" style="width: 100%;">
+                <option value="A">A</option>
+                <option value="AAAA">AAAA</option>
+                <option value="CNAME">CNAME</option>
+                <option value="TXT">TXT</option>
+                <option value="MX">MX</option>
+                <option value="NS">NS</option>
+              </select>
+            </div>
+            <div class="input-group">
+              <label>Name (e.g. @, www)</label>
+              <input type="text" id="dns-record-name" placeholder="example.com">
+            </div>
+          </div>
+          
+          <div class="input-group">
+            <label>Content / Value</label>
+            <input type="text" id="dns-record-content" placeholder="192.168.1.1 or target.com">
+          </div>
+
+          <div style="display: flex; gap: 2rem; align-items: center; margin-bottom: 1.5rem; background: var(--bg-elevated); padding: 1rem; border-radius: 8px;">
+            <div style="display: flex; gap: 0.5rem; align-items: center;">
+              <input type="checkbox" id="dns-record-proxied" style="width: auto;">
+              <label for="dns-record-proxied" style="margin-bottom: 0; cursor: pointer;">Proxied</label>
+            </div>
+            <div style="display: flex; gap: 0.5rem; align-items: center; flex: 1;">
+              <label style="margin-bottom: 0; white-space: nowrap;">TTL:</label>
+              <select class="select-custom" id="dns-record-ttl" style="padding: 0.5rem; flex: 1;">
+                <option value="1">Auto</option>
+                <option value="60">1 min</option>
+                <option value="3600">1 hour</option>
+                <option value="86400">1 day</option>
+              </select>
+            </div>
+          </div>
+
+          <button class="btn btn-primary" id="save-dns-record-btn" style="width: 100%;">
+            Save DNS Record
+          </button>
+        </div>
+      </div>
+    </main>
+  `
+}
+
+function Sidebar() {
+  return `
+    <aside class="sidebar">
+      <div class="nav-item ${state.activeView === 'github' ? 'active' : ''}" data-view="github">
+        <i data-lucide="github"></i> GitHub Repos
+      </div>
+      
+      <div style="margin: 1.5rem 0 0.5rem 1rem; font-size: 0.7rem; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.05em;">Cloudflare</div>
+      
+      <div class="nav-item ${state.activeView === 'cf-domains' ? 'active' : ''}" data-view="cf-domains">
+        <i data-lucide="globe"></i> Manage Domains
+      </div>
+      <div class="nav-item ${state.activeView === 'cf-accounts' ? 'active' : ''}" data-view="cf-accounts">
+        <i data-lucide="users"></i> Manage Accounts
+      </div>
+
+      <div style="margin-top: auto; padding: 1rem; border-top: 1px solid var(--border-subtle);">
+        <div style="font-size: 0.7rem; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 0.5rem;">Resources</div>
+        <a href="https://dash.cloudflare.com" target="_blank" class="nav-item" style="padding: 0.5rem 0.75rem; font-size: 0.85rem;">
+          <i data-lucide="external-link" style="width: 14px;"></i> CF Dashboard
+        </a>
+      </div>
+    </aside>
+  `
+}
+
 function getLangColor(lang) {
   const colors = {
     'JavaScript': '#f7df1e',
@@ -484,7 +897,21 @@ function render() {
   if (!state.token) {
     app.innerHTML = `${Header()}${AuthScreen()}`
   } else if (state.user) {
-    app.innerHTML = `${Header()}${Dashboard()}`
+    app.innerHTML = `
+      ${Header()}
+      <div class="app-layout">
+        ${Sidebar()}
+        <div class="main-content">
+          ${(() => {
+        if (state.activeView === 'github') return Dashboard()
+        if (state.activeView === 'cf-domains') return CloudflareDomainsView()
+        if (state.activeView === 'cf-accounts') return CloudflareAccountsView()
+        if (state.activeView === 'cf-dns') return CloudflareDnsView()
+        return Dashboard()
+      })()}
+        </div>
+      </div>
+    `
   }
 
   bindEvents()
@@ -746,8 +1173,267 @@ function bindEvents() {
     }
   }
 
+  // Sidebar navigation
+  const navItems = document.querySelectorAll('.nav-item[data-view]')
+  navItems.forEach(item => {
+    item.onclick = () => {
+      state.activeView = item.dataset.view
+      state.searchQuery = '' // Reset search when switching tabs
+      render()
+    }
+  })
+
+  // Cloudflare Domain Filter
+  const cfDomainSearch = document.querySelector('#cf-domain-search')
+  if (cfDomainSearch) {
+    cfDomainSearch.oninput = (e) => {
+      state.searchQuery = e.target.value
+      render()
+      // Preserve focus
+      const box = document.querySelector('#cf-domain-search')
+      if (box) {
+        box.focus()
+        box.setSelectionRange(box.value.length, box.value.length)
+      }
+    }
+  }
+
+  // Cloudflare Actions
+  const cfFilterChips = document.querySelectorAll('.chip[data-cf-filter]')
+  cfFilterChips.forEach(chip => {
+    chip.onclick = () => {
+      state.cfAccountFilter = chip.dataset.cfFilter
+      render()
+    }
+  })
+
+  const cfRealFilterChips = document.querySelectorAll('.chip[data-cf-real-filter]')
+  cfRealFilterChips.forEach(chip => {
+    chip.onclick = () => {
+      state.cfRealAccountFilter = chip.dataset.cfRealFilter
+      render()
+    }
+  })
+
+  const addCfBtn = document.querySelector('#add-cf-account-btn')
+  const closeCfBtn = document.querySelector('#close-cf-modal-btn')
+  const saveCfBtn = document.querySelector('#save-cf-account-btn')
+  const cfModal = document.querySelector('#cf-modal-overlay')
+
+  // DNS Record actions
+  const dnsRecordsBtn = document.querySelectorAll('.view-dns-btn')
+  dnsRecordsBtn.forEach(btn => {
+    btn.onclick = async () => {
+      const { zoneId, zoneName, accId } = btn.dataset
+      const localAccount = state.cfAccounts.find(a => a.id === accId)
+      state.activeZone = { zoneId, zoneName, localAccount }
+      state.activeView = 'cf-dns'
+      state.searchQuery = ''
+      render()
+
+      try {
+        const records = await cloudflare.fetchDnsRecords(localAccount, zoneId)
+        state.cfDnsRecords[zoneId] = records
+        render()
+      } catch (err) {
+        Toast.show('Failed to load DNS records: ' + err.message, 'error')
+      }
+    }
+  })
+
+  const backBtn = document.querySelector('#back-to-domains')
+  if (backBtn) backBtn.onclick = () => {
+    state.activeView = 'cf-domains'
+    state.activeZone = null
+    state.searchQuery = ''
+    render()
+  }
+
+  const dnsSearch = document.querySelector('#dns-search')
+  if (dnsSearch) dnsSearch.oninput = (e) => {
+    state.searchQuery = e.target.value
+    render()
+    document.querySelector('#dns-search').focus()
+  }
+
+  const refreshDnsBtn = document.querySelector('#refresh-dns-btn')
+  if (refreshDnsBtn) refreshDnsBtn.onclick = async () => {
+    const { zoneId, localAccount } = state.activeZone
+    try {
+      Toast.show('Refreshing DNS records...', 'info')
+      const records = await cloudflare.fetchDnsRecords(localAccount, zoneId)
+      state.cfDnsRecords[zoneId] = records
+      render()
+      Toast.show('DNS records updated')
+    } catch (err) {
+      Toast.show('Refresh failed: ' + err.message, 'error')
+    }
+  }
+
+  // DNS Modal Logic
+  const dnsModal = document.querySelector('#dns-modal-overlay')
+  const addDnsBtn = document.querySelector('#add-dns-record-btn')
+  const closeDnsBtn = document.querySelector('#close-dns-modal-btn')
+  const saveDnsRecordBtn = document.querySelector('#save-dns-record-btn')
+
+  if (addDnsBtn) addDnsBtn.onclick = () => {
+    document.querySelector('#dns-modal-title').textContent = 'Add DNS Record'
+    document.querySelector('#dns-record-id').value = ''
+    document.querySelector('#dns-record-type').value = 'A'
+    document.querySelector('#dns-record-name').value = ''
+    document.querySelector('#dns-record-content').value = ''
+    document.querySelector('#dns-record-proxied').checked = true
+    document.querySelector('#dns-record-ttl').value = '1'
+    dnsModal.classList.add('active')
+  }
+
+  if (closeDnsBtn) closeDnsBtn.onclick = () => dnsModal.classList.remove('active')
+
+  if (saveDnsRecordBtn) saveDnsRecordBtn.onclick = async () => {
+    const { zoneId, localAccount } = state.activeZone
+    const id = document.querySelector('#dns-record-id').value
+    const data = {
+      type: document.querySelector('#dns-record-type').value,
+      name: document.querySelector('#dns-record-name').value.trim(),
+      content: document.querySelector('#dns-record-content').value.trim(),
+      proxied: document.querySelector('#dns-record-proxied').checked,
+      ttl: parseInt(document.querySelector('#dns-record-ttl').value)
+    }
+
+    if (!data.name || !data.content) {
+      Toast.show('Name and Content are required', 'error')
+      return
+    }
+
+    try {
+      state.loading = true
+      render()
+      if (id) {
+        await cloudflare.updateDnsRecord(localAccount, zoneId, id, data)
+        Toast.show('Record updated successfully')
+      } else {
+        await cloudflare.createDnsRecord(localAccount, zoneId, data)
+        Toast.show('Record created successfully')
+      }
+      // Refresh list
+      const records = await cloudflare.fetchDnsRecords(localAccount, zoneId)
+      state.cfDnsRecords[zoneId] = records
+    } catch (err) {
+      Toast.show('Error: ' + err.message, 'error')
+    } finally {
+      state.loading = false
+      render()
+    }
+  }
+
+  // Individual DNS Actions
+  const editDnsBtns = document.querySelectorAll('.edit-dns-btn')
+  editDnsBtns.forEach(btn => {
+    btn.onclick = () => {
+      const { id, type, name, content, proxied, ttl } = btn.dataset
+      document.querySelector('#dns-modal-title').textContent = 'Edit DNS Record'
+      document.querySelector('#dns-record-id').value = id
+      document.querySelector('#dns-record-type').value = type
+      document.querySelector('#dns-record-name').value = name
+      document.querySelector('#dns-record-content').value = content
+      document.querySelector('#dns-record-proxied').checked = proxied === 'true'
+      document.querySelector('#dns-record-ttl').value = ttl
+      dnsModal.classList.add('active')
+    }
+  })
+
+  const deleteDnsBtns = document.querySelectorAll('.delete-dns-btn')
+  deleteDnsBtns.forEach(btn => {
+    btn.onclick = async () => {
+      const { id, name } = btn.dataset
+      const { zoneId, localAccount } = state.activeZone
+      const confirmed = await Confirm('Delete DNS Record', `Are you sure you want to delete the record for ${name}?`, 'Delete')
+      if (confirmed) {
+        try {
+          state.loading = true
+          render()
+          await cloudflare.deleteDnsRecord(localAccount, zoneId, id)
+          Toast.show('Record deleted')
+          const records = await cloudflare.fetchDnsRecords(localAccount, zoneId)
+          state.cfDnsRecords[zoneId] = records
+        } catch (err) {
+          Toast.show('Delete failed: ' + err.message, 'error')
+        } finally {
+          state.loading = false
+          render()
+        }
+      }
+    }
+  })
+
+  if (addCfBtn) addCfBtn.onclick = () => cfModal.classList.add('active')
+  if (closeCfBtn) closeCfBtn.onclick = () => cfModal.classList.remove('active')
+  if (saveCfBtn) saveCfBtn.onclick = async () => {
+    const name = document.querySelector('#cf-acc-name').value.trim()
+    const email = document.querySelector('#cf-acc-email').value.trim()
+    const key = document.querySelector('#cf-acc-key').value.trim()
+
+    if (!email || !key) {
+      Toast.show('Email and Global API Key are required', 'error')
+      return
+    }
+
+    const newAccount = {
+      id: Date.now().toString(),
+      name: name || email,
+      email,
+      key
+    }
+
+    state.cfAccounts.push(newAccount)
+    localStorage.setItem('cf_accounts', JSON.stringify(state.cfAccounts))
+    cfModal.classList.remove('active')
+    Toast.show('Cloudflare account added')
+
+    // Fetch zones for the new account
+    try {
+      state.loading = true
+      render()
+      const zones = await cloudflare.fetchZones(newAccount)
+      state.cfZones[newAccount.id] = zones
+    } catch (err) {
+      Toast.show('Failed to fetch domains: ' + err.message, 'error')
+    } finally {
+      state.loading = false
+      render()
+    }
+  }
+
+  const removeCfBtns = document.querySelectorAll('.remove-cf-acc')
+  removeCfBtns.forEach(btn => {
+    btn.onclick = async () => {
+      const id = btn.dataset.id
+      const confirmed = await Confirm('Remove Account', 'Are you sure you want to remove this Cloudflare account?', 'Remove')
+      if (confirmed) {
+        state.cfAccounts = state.cfAccounts.filter(acc => acc.id !== id)
+        delete state.cfZones[id]
+        localStorage.setItem('cf_accounts', JSON.stringify(state.cfAccounts))
+        render()
+        Toast.show('Account removed')
+      }
+    }
+  })
+
   // Bind repo list items initially
   bindRepoItemEvents()
+}
+
+async function fetchAllCfZones() {
+  for (const account of state.cfAccounts) {
+    if (state.cfZones[account.id]) continue
+    try {
+      const zones = await cloudflare.fetchZones(account)
+      state.cfZones[account.id] = zones
+      render()
+    } catch (err) {
+      console.warn(`Failed to fetch zones for ${account.email}:`, err)
+    }
+  }
 }
 
 async function fetchAllStats() {
