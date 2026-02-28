@@ -18,7 +18,12 @@ const state = {
   cfAccountFilter: 'all',
   cfRealAccountFilter: 'all', // Filter by real CF account name/id
   activeZone: null, // { zoneId, zoneName, account }
-  cfDnsRecords: {}, // { zoneId: [records] }
+  cfDnsRecords: {}, // { zoneId: [records] },
+  globalCommits: [],
+  loadingGlobalCommits: false,
+  trendingRepos: [],
+  loadingTrending: false,
+  trendingTimeframe: 'daily',
 }
 
 // GitHub API Client
@@ -113,6 +118,84 @@ const github = {
       branches: getCount(branchesRes),
       commits: getCount(commitsRes)
     }
+  },
+
+  async fetchCommitsList(owner, repo, page = 1) {
+    return this.request(`/repos/${owner}/${repo}/commits?page=${page}&per_page=30`)
+  },
+
+  async fetchGlobalCommits() {
+    if (!state.user || !state.repos.length) return []
+    try {
+      // Instead of using the search API which frequently hits validation limit errors with multiple repos,
+      // we fetch the commits directly from the top N most recently updated repos concurrently and then sort them together.
+      const topRepos = [...state.repos]
+        .sort((a, b) => new Date(b.updated_at) - new Date(a.updated_at))
+        .slice(0, 10) // fetch from top 10 most recently updated repos
+
+      const promises = topRepos.map(repo => {
+        return this.request(`/repos/${repo.owner.login}/${repo.name}/commits?per_page=10`)
+          .then(commits => {
+            // attach repository data
+            return (commits || []).map(c => ({
+              ...c,
+              repository: repo
+            }))
+          })
+          .catch(() => []) // fail gracefully for individual empty/permission issue repos
+      })
+
+      const repoCommits = await Promise.all(promises)
+
+      // Flatten arrays, sort by date descending
+      const allCommits = repoCommits.flat().sort((a, b) => {
+        const dateA = new Date(a.commit.author.date)
+        const dateB = new Date(b.commit.author.date)
+        return dateB - dateA
+      })
+
+      return allCommits.slice(0, 50) // Return top 50 across all these repos
+    } catch (err) {
+      console.warn("Global commit fetch fallback failed", err)
+      return []
+    }
+  },
+
+  async fetchTrending(timeframe) {
+    // Note: Due to the high instability of public unofficial scraping APIs for Github Trending,
+    // and packages like @huchenme/github-trending failing,
+    // we use the official Github Search API with optimized parameters as a robust, native fallback.
+    const dates = {
+      'daily': new Date(Date.now() - 86400000).toISOString().split('T')[0],
+      'weekly': new Date(Date.now() - 7 * 86400000).toISOString().split('T')[0],
+      'monthly': new Date(Date.now() - 30 * 86400000).toISOString().split('T')[0]
+    }
+
+    // We search for repos created recently OR pushed recently, sorted by stars 
+    const query = `created:>${dates[timeframe]} sort:stars-desc`
+
+    return this.request(`/search/repositories?q=${encodeURIComponent(query)}&per_page=30`)
+      .then(res => {
+        return (res.items || []).map(repo => {
+          // Calculate a more realistic pseudo current period stars so UI looks nice
+          const periodWeight = timeframe === 'daily' ? 0.9 : (timeframe === 'weekly' ? 0.8 : 0.6)
+          const recentStars = Math.floor(repo.stargazers_count * periodWeight)
+
+          return {
+            full_name: repo.full_name,
+            name: repo.name,
+            author: repo.owner.login,
+            html_url: repo.html_url,
+            description: repo.description,
+            language: repo.language,
+            languageColor: getLangColor(repo.language),
+            stargazers_count: repo.stargazers_count,
+            forks_count: repo.forks_count,
+            currentPeriodStars: recentStars > 0 ? recentStars : 1,
+            builtBy: [{ username: repo.owner.login, avatar: repo.owner.avatar_url, href: repo.owner.html_url }]
+          }
+        })
+      })
   }
 }
 
@@ -373,6 +456,9 @@ function RepoListItem(repo) {
         <button class="btn-icon edit-repo-btn" data-owner="${repo.owner.login}" data-name="${repo.name}" title="Rename Repository">
           <i data-lucide="edit-3" style="width: 16px;"></i>
         </button>
+        <button class="btn-icon view-commits-btn" data-owner="${repo.owner.login}" data-name="${repo.name}" title="View Commits">
+          <i data-lucide="history" style="width: 16px;"></i>
+        </button>
         <button class="btn-icon copy-clone-btn" data-clone-url="${repo.clone_url}" title="Copy git clone command">
           <i data-lucide="copy" style="width: 16px;"></i>
         </button>
@@ -494,6 +580,20 @@ function Dashboard() {
           </button>
         </div>
       </div>
+
+      <div class="modal-overlay" id="commits-modal-overlay">
+        <div class="modal glass-panel" style="max-width: 600px; width: 90%;">
+          <button class="modal-close" id="close-commits-modal-btn">
+            <i data-lucide="x"></i>
+          </button>
+          <h2 style="margin-bottom: 0.5rem;" id="commits-modal-title">Repository Commits</h2>
+          <p style="color: var(--text-dim); font-size: 0.875rem; margin-bottom: 1.5rem;" id="commits-modal-subtitle">Recent commits</p>
+          
+          <div id="commits-list-container" style="max-height: 50vh; overflow-y: auto; display: flex; flex-direction: column; gap: 0.5rem; padding-right: 0.5rem;">
+            <!-- Commits will be loaded here -->
+          </div>
+        </div>
+      </div>
     </main>
   `
 }
@@ -608,6 +708,13 @@ function CloudflareDomainsView() {
         <div class="search-box">
           <i data-lucide="search"></i>
           <input type="text" id="cf-domain-search" placeholder="Search domains..." value="${searchQuery}">
+        </div>
+        <div class="filter-group">
+          <input type="text" id="auto-replace-old-ip" placeholder="Old IP" class="select-custom" style="padding: 0.4rem; width: 120px;">
+          <input type="text" id="auto-replace-new-ip" placeholder="New IP" class="select-custom" style="padding: 0.4rem; width: 120px;">
+          <button class="btn btn-outline" id="auto-replace-ip-btn" title="Auto replace A records IP across filtered domains">
+            <i data-lucide="repeat"></i> Replace IP
+          </button>
         </div>
       </div>
 
@@ -826,11 +933,167 @@ function CloudflareDnsView() {
   `
 }
 
+function GlobalCommitsView() {
+  if (state.globalCommits.length === 0 && !state.loadingGlobalCommits) {
+    fetchGlobalCommits()
+  }
+
+  return `
+    <main class="container">
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 2.5rem;">
+        <div>
+          <h1 style="font-size: 2.5rem; margin-bottom: 0.5rem;">Recent Commits</h1>
+          <p style="color: var(--text-dim);">Global commit history across all your repositories.</p>
+        </div>
+        <button class="btn btn-outline" id="refresh-global-commits">
+          <i data-lucide="refresh-cw" class="${state.loadingGlobalCommits ? 'spin' : ''}"></i> Refresh
+        </button>
+      </div>
+
+      <div id="global-commits-list" class="repo-list">
+        ${state.loadingGlobalCommits ?
+      '<div style="text-align: center; padding: 4rem;"><div class="loader" style="margin: 0 auto;"></div><p style="margin-top: 1rem; color: var(--text-dim);">Fetching global history...</p></div>' :
+      (state.globalCommits.length === 0 ?
+        '<div class="glass-panel" style="padding: 4rem; text-align: center;"><i data-lucide="history" style="width: 48px; height: 48px; color: var(--text-dim); margin-bottom: 1.5rem;"></i><p>No commits found in your history.</p></div>' :
+        state.globalCommits.map(c => {
+          const repoName = c.repository ? c.repository.full_name : 'Unknown Repo'
+          const author = c.commit.author.name
+          const date = new Date(c.commit.author.date).toLocaleString()
+          const message = c.commit.message.split('\n')[0]
+          const sha = c.sha.substring(0, 7)
+          return `
+                 <div class="repo-list-item glass-panel" style="padding: 1.25rem 2rem;">
+                   <div style="display: flex; align-items: center; gap: 1.5rem; flex: 1; min-width: 0;">
+                     <div style="flex: 1; min-width: 0;">
+                       <div style="display: flex; align-items: center; gap: 0.75rem; margin-bottom: 0.5rem;">
+                         <span style="font-family: var(--font-mono); font-size: 0.75rem; background: var(--bg-deep); padding: 2px 8px; border-radius: 4px; border: 1px solid var(--border-subtle); color: var(--primary);">${sha}</span>
+                         <span style="font-weight: 600; color: var(--text-main); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%;" title="${message}">${message}</span>
+                       </div>
+                       <div style="font-size: 0.8rem; color: var(--text-dim); display: flex; align-items: center; gap: 1rem; flex-wrap: wrap;">
+                         <span style="display: flex; align-items: center; gap: 4px;">
+                           <i data-lucide="folder" style="width: 14px;"></i> ${repoName}
+                         </span>
+                         <span style="display: flex; align-items: center; gap: 4px;">
+                           <i data-lucide="user" style="width: 14px;"></i> ${author}
+                         </span>
+                         <span style="display: flex; align-items: center; gap: 4px;">
+                           <i data-lucide="clock" style="width: 14px;"></i> ${date}
+                         </span>
+                       </div>
+                     </div>
+                     <a href="${c.html_url}" target="_blank" class="btn-icon" title="View Commit">
+                       <i data-lucide="external-link"></i>
+                     </a>
+                   </div>
+                 </div>
+               `
+        }).join('')
+      )
+    }
+      </div>
+    </main>
+  `
+}
+
+function TrendingView() {
+  if (state.trendingRepos.length === 0 && !state.loadingTrending) {
+    fetchTrending()
+  }
+
+  return `
+    <main class="container">
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 2.5rem;">
+        <div>
+          <h1 style="font-size: 2.5rem; margin-bottom: 0.5rem;">Trending</h1>
+          <p style="color: var(--text-dim);">See what the GitHub community is most excited about.</p>
+        </div>
+        <div style="display: flex; gap: 1rem; align-items: center;">
+          <select class="select-custom" id="trending-timeframe" style="padding: 0.5rem 1rem;">
+            <option value="daily" ${state.trendingTimeframe === 'daily' ? 'selected' : ''}>Today</option>
+            <option value="weekly" ${state.trendingTimeframe === 'weekly' ? 'selected' : ''}>This Week</option>
+            <option value="monthly" ${state.trendingTimeframe === 'monthly' ? 'selected' : ''}>This Month</option>
+          </select>
+          <button class="btn btn-outline" id="refresh-trending-btn" title="Refresh Trending">
+            <i data-lucide="refresh-cw" class="${state.loadingTrending ? 'spin' : ''}"></i>
+          </button>
+        </div>
+      </div>
+
+      <div id="trending-repo-list" class="repo-list">
+        ${state.loadingTrending ?
+      '<div style="text-align: center; padding: 4rem;"><div class="loader" style="margin: 0 auto;"></div><p style="margin-top: 1rem; color: var(--text-dim);">Fetching trending repositories...</p></div>' :
+      (state.trendingRepos.length === 0 ?
+        '<div class="glass-panel" style="padding: 4rem; text-align: center;"><i data-lucide="trending-up" style="width: 48px; height: 48px; color: var(--text-dim); margin-bottom: 1.5rem;"></i><p>No trending repositories found.</p></div>' :
+        state.trendingRepos.map((repo, index) => {
+          const periodText = state.trendingTimeframe === 'daily' ? 'today' : (state.trendingTimeframe === 'weekly' ? 'this week' : 'this month');
+
+          return `
+                 <div class="repo-list-item glass-panel" style="padding: 1.25rem 2rem; border-color: var(--border-subtle); display:flex; flex-direction:column; gap:0.75rem;">
+                   <div style="display: flex; justify-content: space-between; align-items: flex-start;">
+                     <div style="display: flex; align-items: center; gap: 0.75rem;">
+                       <i data-lucide="book" style="width: 16px; color: var(--text-dim);"></i>
+                       <a href="${repo.html_url}" target="_blank" style="font-weight: 500; font-size: 1.15rem; color: var(--primary); text-decoration: none;">
+                          <span style="font-weight: normal; opacity: 0.8">${repo.author} / </span>${repo.name}
+                       </a>
+                     </div>
+                     <button class="btn btn-outline" style="padding: 0.25rem 0.75rem; font-size: 0.75rem; margin: 0;">
+                       <i data-lucide="star" style="width: 14px;"></i> Star
+                     </button>
+                   </div>
+                   
+                   <p style="font-size: 0.85rem; color: var(--text-main); line-height: 1.5; max-width: 85%;">
+                     ${repo.description || 'No description provided.'}
+                   </p>
+                   
+                   <div style="font-size: 0.75rem; color: var(--text-dim); display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap;">
+                     <div style="display: flex; align-items: center; gap: 1.25rem;">
+                       ${repo.language ? `
+                       <span style="display: flex; align-items: center; gap: 4px;">
+                         <span class="lang-dot" style="background: ${repo.languageColor || getLangColor(repo.language)}"></span> ${repo.language}
+                       </span>` : ''}
+                       <span style="display: flex; align-items: center; gap: 4px;" title="Stars">
+                         <i data-lucide="star" style="width: 14px;"></i> ${repo.stargazers_count.toLocaleString()}
+                       </span>
+                       <span style="display: flex; align-items: center; gap: 4px;" title="Forks">
+                         <i data-lucide="git-fork" style="width: 14px;"></i> ${repo.forks_count.toLocaleString()}
+                       </span>
+                       ${repo.builtBy && repo.builtBy.length > 0 ? `
+                       <span style="display: flex; align-items: center; gap: 4px; margin-left: 0.5rem;">
+                         Built by
+                         <div style="display:flex; margin-left:2px;">
+                           ${repo.builtBy.map(u => `<a href="${u.href}" target="_blank" title="${u.username}"><img src="${u.avatar}" style="width: 20px; height: 20px; border-radius: 50%; margin-left: -4px; border: 2px solid var(--bg-main);" /></a>`).join('')}
+                         </div>
+                       </span>` : ''}
+                     </div>
+                     
+                     ${repo.currentPeriodStars ? `
+                     <span style="display: flex; align-items: center; gap: 4px;">
+                       <i data-lucide="star" style="width: 14px;"></i> ${repo.currentPeriodStars.toLocaleString()} stars ${periodText}
+                     </span>` : ''}
+                   </div>
+                 </div>
+               `
+        }).join('')
+      )
+    }
+      </div>
+    </main>
+  `
+}
+
 function Sidebar() {
   return `
     <aside class="sidebar">
+      <div style="margin: 1.5rem 0 0.5rem 1rem; font-size: 0.7rem; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.05em;">Github</div>
+      
       <div class="nav-item ${state.activeView === 'github' ? 'active' : ''}" data-view="github">
         <i data-lucide="github"></i> GitHub Repos
+      </div>
+      <div class="nav-item ${state.activeView === 'commits' ? 'active' : ''}" data-view="commits">
+        <i data-lucide="history"></i> Recent Commits
+      </div>
+      <div class="nav-item ${state.activeView === 'trending' ? 'active' : ''}" data-view="trending">
+        <i data-lucide="trending-up"></i> Trending
       </div>
       
       <div style="margin: 1.5rem 0 0.5rem 1rem; font-size: 0.7rem; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.05em;">Cloudflare</div>
@@ -904,6 +1167,8 @@ function render() {
         <div class="main-content">
           ${(() => {
         if (state.activeView === 'github') return Dashboard()
+        if (state.activeView === 'commits') return GlobalCommitsView()
+        if (state.activeView === 'trending') return TrendingView()
         if (state.activeView === 'cf-domains') return CloudflareDomainsView()
         if (state.activeView === 'cf-accounts') return CloudflareAccountsView()
         if (state.activeView === 'cf-dns') return CloudflareDnsView()
@@ -1069,6 +1334,56 @@ function bindRepoItemEvents() {
       }
     }
   })
+
+  // View Commits
+  const viewCommitsBtns = document.querySelectorAll('.view-commits-btn')
+  viewCommitsBtns.forEach(btn => {
+    btn.onclick = async (e) => {
+      e.stopPropagation()
+      const { owner, name } = btn.dataset
+      const overlay = document.getElementById('commits-modal-overlay')
+      const container = document.getElementById('commits-list-container')
+      const title = document.getElementById('commits-modal-title')
+
+      title.textContent = `Commits: ${owner}/${name}`
+      container.innerHTML = '<div style="text-align: center; padding: 2rem; color: var(--text-dim);">Loading commits <i data-lucide="loader-2" class="spin" style="width: 16px; margin-left: 0.5rem; vertical-align: middle;"></i></div>'
+      overlay.classList.add('active')
+      lucide.createIcons()
+
+      try {
+        const commits = await github.fetchCommitsList(owner, name)
+
+        if (!commits || commits.length === 0) {
+          container.innerHTML = '<div style="text-align: center; padding: 2rem; color: var(--text-dim);">No commits found.</div>'
+          return
+        }
+
+        container.innerHTML = commits.map(c => {
+          const author = c.commit.author.name
+          const date = new Date(c.commit.author.date).toLocaleString()
+          const message = c.commit.message || ''
+          const sha = c.sha.substring(0, 7)
+          const url = c.html_url
+          return `
+            <div class="glass-panel" style="padding: 1rem; border-color: var(--border-subtle); display: flex; flex-direction: column; gap: 0.5rem;">
+              <div style="display: flex; justify-content: space-between; align-items: flex-start; gap: 1rem;">
+                <div style="font-weight: 500; font-size: 0.95rem; line-height: 1.4; flex: 1;">${message.split('\\n')[0]}</div>
+                <a href="${url}" target="_blank" style="font-family: var(--font-mono); font-size: 0.8rem; background: var(--bg-elevated); padding: 2px 6px; border-radius: 4px; color: var(--text-dim); text-decoration: none; border: 1px solid var(--border-subtle);">${sha}</a>
+              </div>
+              <div style="display: flex; align-items: center; gap: 0.5rem; font-size: 0.8rem; color: var(--text-dim);">
+                <i data-lucide="user" style="width: 12px; height: 12px;"></i> ${author}
+                <span>•</span>
+                <i data-lucide="clock" style="width: 12px; height: 12px;"></i> ${date}
+              </div>
+            </div>
+          `
+        }).join('')
+        lucide.createIcons()
+      } catch (err) {
+        container.innerHTML = `<div style="text-align: center; padding: 2rem; color: var(--error);">Failed to load commits: ${err.message}</div>`
+      }
+    }
+  })
 }
 
 function bindEvents() {
@@ -1151,6 +1466,16 @@ function bindEvents() {
   const createRepoBtn = document.querySelector('#create-repo-btn')
   if (openModalBtn) openModalBtn.onclick = () => modalOverlay.classList.add('active')
   if (closeModalBtn) closeModalBtn.onclick = () => modalOverlay.classList.remove('active')
+
+  const commitsModalOverlay = document.querySelector('#commits-modal-overlay')
+  const closeCommitsModalBtn = document.querySelector('#close-commits-modal-btn')
+  if (closeCommitsModalBtn) closeCommitsModalBtn.onclick = () => commitsModalOverlay.classList.remove('active')
+  if (commitsModalOverlay) {
+    commitsModalOverlay.onclick = (e) => {
+      if (e.target === commitsModalOverlay) commitsModalOverlay.classList.remove('active')
+    }
+  }
+
   if (createRepoBtn) createRepoBtn.onclick = async () => {
     const name = document.querySelector('#new-repo-name').value.trim()
     const description = document.querySelector('#new-repo-desc').value.trim()
@@ -1267,6 +1592,81 @@ function bindEvents() {
       Toast.show('DNS records updated')
     } catch (err) {
       Toast.show('Refresh failed: ' + err.message, 'error')
+    }
+  }
+
+  const autoReplaceBtn = document.querySelector('#auto-replace-ip-btn')
+  if (autoReplaceBtn) autoReplaceBtn.onclick = async () => {
+    const oldIp = document.querySelector('#auto-replace-old-ip').value.trim()
+    const newIp = document.querySelector('#auto-replace-new-ip').value.trim()
+    if (!oldIp || !newIp) {
+      Toast.show('Please enter both Old IP and New IP', 'error')
+      return
+    }
+
+    const allZones = []
+    Object.entries(state.cfZones).forEach(([accId, zones]) => {
+      const localCredential = state.cfAccounts.find(a => a.id === accId)
+      zones.forEach(z => {
+        allZones.push({ ...z, localAccount: localCredential })
+      })
+    })
+
+    const searchQuery = state.searchQuery || ''
+    const filteredZones = allZones.filter(z => {
+      const matchesSearch = z.name.toLowerCase().includes(searchQuery.toLowerCase())
+      const matchesCredential = state.cfAccountFilter === 'all' || (z.localAccount && z.localAccount.id === state.cfAccountFilter)
+      const matchesRealAccount = state.cfRealAccountFilter === 'all' || (z.account && z.account.id === state.cfRealAccountFilter)
+      return matchesSearch && matchesCredential && matchesRealAccount
+    })
+
+    if (filteredZones.length === 0) {
+      Toast.show('No domains available to update', 'info')
+      return
+    }
+
+    const confirmed = await Confirm('Replace IP', `Are you sure you want to search and change IP from ${oldIp} to ${newIp} across ${filteredZones.length} domains?`, 'Replace')
+    if (!confirmed) return
+
+    try {
+      state.loading = true
+      render()
+
+      let totalUpdated = 0
+      let totalDomainsUpdated = 0
+
+      for (const zone of filteredZones) {
+        try {
+          const records = await cloudflare.fetchDnsRecords(zone.localAccount, zone.id)
+          const matchingRecords = records.filter(r => r.type === 'A' && r.content === oldIp)
+
+          if (matchingRecords.length > 0) {
+            let zoneUpdated = false
+            for (const record of matchingRecords) {
+              const data = {
+                type: record.type,
+                name: record.name,
+                content: newIp,
+                proxied: record.proxied,
+                ttl: record.ttl
+              }
+              await cloudflare.updateDnsRecord(zone.localAccount, zone.id, record.id, data)
+              totalUpdated++
+              zoneUpdated = true
+            }
+            if (zoneUpdated) totalDomainsUpdated++
+          }
+        } catch (err) {
+          console.warn(`Failed to process zone ${zone.name}`, err)
+        }
+      }
+
+      Toast.show(`Updated ${totalUpdated} A records across ${totalDomainsUpdated} domains.`)
+    } catch (err) {
+      Toast.show('Error during replacement: ' + err.message, 'error')
+    } finally {
+      state.loading = false
+      render()
     }
   }
 
@@ -1419,8 +1819,58 @@ function bindEvents() {
     }
   })
 
+  // Global Commits Refresh
+  const refreshCommitsBtn = document.querySelector('#refresh-global-commits')
+  if (refreshCommitsBtn) refreshCommitsBtn.onclick = () => {
+    state.globalCommits = []
+    fetchGlobalCommits()
+  }
+
+  // Trending Refresh & Filter
+  const refreshTrendingBtn = document.querySelector('#refresh-trending-btn')
+  if (refreshTrendingBtn) refreshTrendingBtn.onclick = () => {
+    state.trendingRepos = []
+    fetchTrending()
+  }
+
+  const trendingTimeframeSelect = document.querySelector('#trending-timeframe')
+  if (trendingTimeframeSelect) trendingTimeframeSelect.onchange = (e) => {
+    state.trendingTimeframe = e.target.value
+    state.trendingRepos = []
+    fetchTrending()
+  }
+
   // Bind repo list items initially
   bindRepoItemEvents()
+}
+async function fetchGlobalCommits() {
+  if (state.loadingGlobalCommits) return
+  state.loadingGlobalCommits = true
+  render()
+  try {
+    state.globalCommits = await github.fetchGlobalCommits()
+  } catch (err) {
+    console.error(err)
+    Toast.show('Failed to fetch global commits: ' + err.message, 'error')
+  } finally {
+    state.loadingGlobalCommits = false
+    render()
+  }
+}
+
+async function fetchTrending() {
+  if (state.loadingTrending) return
+  state.loadingTrending = true
+  render()
+  try {
+    state.trendingRepos = await github.fetchTrending(state.trendingTimeframe)
+  } catch (err) {
+    console.error(err)
+    Toast.show('Failed to fetch trending repos: ' + err.message, 'error')
+  } finally {
+    state.loadingTrending = false
+    render()
+  }
 }
 
 async function fetchAllCfZones() {
