@@ -24,6 +24,8 @@ const state = {
   trendingRepos: [],
   loadingTrending: false,
   trendingTimeframe: 'daily',
+  trendingQuery: '',
+  trendingIsSearchResult: false,
   kanbanTasks: JSON.parse(localStorage.getItem('kanban_tasks')) || [],
   kanbanFilters: {
     repo: 'all',
@@ -384,6 +386,27 @@ const github = {
             stargazers_count: repo.stargazers_count,
             forks_count: repo.forks_count,
             currentPeriodStars: recentStars > 0 ? recentStars : 1,
+            builtBy: [{ username: repo.owner.login, avatar: repo.owner.avatar_url, href: repo.owner.html_url }]
+          }
+        })
+      })
+  },
+
+  async searchRepos(query) {
+    return this.request(`/search/repositories?q=${encodeURIComponent(query)}&sort=stars&order=desc&per_page=30`)
+      .then(res => {
+        return (res.items || []).map(repo => {
+          return {
+            full_name: repo.full_name,
+            name: repo.name,
+            author: repo.owner.login,
+            html_url: repo.html_url,
+            description: repo.description,
+            language: repo.language,
+            languageColor: getLangColor(repo.language),
+            stargazers_count: repo.stargazers_count,
+            forks_count: repo.forks_count,
+            currentPeriodStars: null,
             builtBy: [{ username: repo.owner.login, avatar: repo.owner.avatar_url, href: repo.owner.html_url }]
           }
         })
@@ -1416,20 +1439,47 @@ function TrendingView() {
     fetchTrending()
   }
 
+  const query = (state.trendingQuery || '').toLowerCase().trim()
+  const displayRepos = state.trendingRepos.filter(repo => {
+    return repo.name.toLowerCase().includes(query) || 
+           repo.author.toLowerCase().includes(query) || 
+           (repo.description || '').toLowerCase().includes(query) ||
+           (repo.language || '').toLowerCase().includes(query)
+  })
+
+  const periodText = state.trendingTimeframe === 'daily' ? 'today' : (state.trendingTimeframe === 'weekly' ? 'this week' : 'this month')
+
+  const isSearchMode = state.trendingIsSearchResult
+
   return `
     <div class="page-content">
-      <div class="page-header">
+      <div class="page-header" style="flex-wrap:wrap;gap:1rem;">
         <div class="page-header-text">
-          <h1 class="page-title">Trending</h1>
-          <p class="page-subtitle">See what the GitHub community is most excited about.</p>
+          <h1 class="page-title">${isSearchMode ? 'GitHub Search' : 'Trending'}</h1>
+          <p class="page-subtitle">
+            ${isSearchMode ? 
+              `Search results for "${state.trendingQuery}" on GitHub.` : 
+              'See what the GitHub community is most excited about.'
+            }
+            ${isSearchMode ? `<span style="color:var(--accent-light);cursor:pointer;margin-left:8px;text-decoration:underline;" id="back-to-trending-link"><i data-lucide="arrow-left" style="width:12px;height:12px;display:inline-block;vertical-align:middle;margin-right:2px;"></i> Back to Trending</span>` : ''}
+          </p>
         </div>
-        <div class="page-actions">
-          <select class="select-custom" id="trending-timeframe">
-            <option value="daily" ${state.trendingTimeframe === 'daily' ? 'selected' : ''}>Today</option>
-            <option value="weekly" ${state.trendingTimeframe === 'weekly' ? 'selected' : ''}>This Week</option>
-            <option value="monthly" ${state.trendingTimeframe === 'monthly' ? 'selected' : ''}>This Month</option>
-          </select>
-          <button class="btn btn-ghost" id="refresh-trending-btn" title="Refresh">
+        <div class="page-actions" style="gap:0.75rem;flex-wrap:wrap;">
+          <div class="search-input-wrapper" style="position:relative;width:240px;">
+            <i data-lucide="search" style="position:absolute;left:0.75rem;top:50%;transform:translateY(-50%);width:14px;height:14px;color:var(--text-muted);"></i>
+            <input type="text" class="input-custom" id="trending-search-input" placeholder="Search trending or GitHub..." value="${state.trendingQuery || ''}" style="padding-left:2.25rem;width:100%;height:36px;">
+          </div>
+          <button class="btn btn-primary" id="trending-global-search-btn" title="Search globally on GitHub" style="height:36px;">
+            <i data-lucide="github"></i> Search GitHub
+          </button>
+          ${!isSearchMode ? `
+            <select class="select-custom" id="trending-timeframe" style="height:36px;">
+              <option value="daily" ${state.trendingTimeframe === 'daily' ? 'selected' : ''}>Today</option>
+              <option value="weekly" ${state.trendingTimeframe === 'weekly' ? 'selected' : ''}>This Week</option>
+              <option value="monthly" ${state.trendingTimeframe === 'monthly' ? 'selected' : ''}>This Month</option>
+            </select>
+          ` : ''}
+          <button class="btn btn-ghost" id="refresh-trending-btn" title="Refresh" style="height:36px;width:36px;padding:0;display:flex;align-items:center;justify-content:center;">
             <i data-lucide="refresh-cw" class="${state.loadingTrending ? 'spin' : ''}"></i>
           </button>
         </div>
@@ -1437,15 +1487,14 @@ function TrendingView() {
 
       <div id="trending-repo-list" class="list-stack">
         ${state.loadingTrending ?
-          `<div class="loading-center"><div class="loader" style="margin:0;"></div><span>Fetching trending repositories...</span></div>` :
-          (state.trendingRepos.length === 0 ?
+          `<div class="loading-center"><div class="loader" style="margin:0;"></div><span>${isSearchMode ? 'Searching GitHub...' : 'Fetching trending repositories...'}</span></div>` :
+          (displayRepos.length === 0 ?
             `<div class="empty-state">
               <i data-lucide="trending-up" class="empty-state-icon"></i>
-              <h3>No Trending Repos</h3>
-              <p>Could not fetch trending repositories. Try refreshing.</p>
+              <h3>No Repositories Found</h3>
+              <p>No results match your criteria. Click "Search GitHub" or press Enter to query GitHub globally.</p>
             </div>` :
-            state.trendingRepos.map((repo, index) => {
-              const periodText = state.trendingTimeframe === 'daily' ? 'today' : (state.trendingTimeframe === 'weekly' ? 'this week' : 'this month')
+            displayRepos.map((repo, index) => {
               return `
                 <div class="list-item" style="align-items:flex-start;padding:1rem 1.25rem;">
                   <div style="width:28px;height:28px;display:flex;align-items:center;justify-content:center;font-family:var(--font-mono);font-size:0.75rem;font-weight:700;color:var(--text-muted);flex-shrink:0;">
@@ -1488,6 +1537,7 @@ function KanbanView() {
     { id: 'backlog', title: 'Backlog', icon: 'clipboard-list', color: 'var(--text-muted)' },
     { id: 'todo', title: 'To Do', icon: 'circle', color: 'var(--accent-light)' },
     { id: 'in_progress', title: 'In Progress', icon: 'play-circle', color: 'var(--warning)' },
+    { id: 'review', title: 'In Review', icon: 'git-pull-request', color: 'var(--info)' },
     { id: 'done', title: 'Done', icon: 'check-circle-2', color: 'var(--success)' }
   ]
 
@@ -1574,6 +1624,7 @@ function KanbanView() {
                 <option value="backlog">Backlog</option>
                 <option value="todo">To Do</option>
                 <option value="in_progress">In Progress</option>
+                <option value="review">In Review</option>
                 <option value="done">Done</option>
               </select>
             </div>
@@ -3200,7 +3251,11 @@ function bindEvents() {
   const refreshTrendingBtn = document.querySelector('#refresh-trending-btn')
   if (refreshTrendingBtn) refreshTrendingBtn.onclick = () => {
     state.trendingRepos = []
-    fetchTrending()
+    if (state.trendingIsSearchResult) {
+      searchGitHubTrending(state.trendingQuery)
+    } else {
+      fetchTrending()
+    }
   }
 
   const trendingTimeframeSelect = document.querySelector('#trending-timeframe')
@@ -3208,6 +3263,44 @@ function bindEvents() {
     state.trendingTimeframe = e.target.value
     state.trendingRepos = []
     fetchTrending()
+  }
+
+  const trendingSearchInput = document.querySelector('#trending-search-input')
+  if (trendingSearchInput) {
+    trendingSearchInput.oninput = (e) => {
+      state.trendingQuery = e.target.value
+      renderTrendingListOnly()
+    }
+    trendingSearchInput.onkeydown = (e) => {
+      if (e.key === 'Enter') {
+        const query = e.target.value.trim()
+        if (query) {
+          searchGitHubTrending(query)
+        }
+      }
+    }
+  }
+
+  const trendingGlobalSearchBtn = document.querySelector('#trending-global-search-btn')
+  if (trendingGlobalSearchBtn) {
+    trendingGlobalSearchBtn.onclick = () => {
+      const query = (state.trendingQuery || '').trim()
+      if (query) {
+        searchGitHubTrending(query)
+      } else {
+        Toast.show('Please enter a query to search GitHub', 'error')
+      }
+    }
+  }
+
+  const backToTrendingLink = document.querySelector('#back-to-trending-link')
+  if (backToTrendingLink) {
+    backToTrendingLink.onclick = () => {
+      state.trendingIsSearchResult = false
+      state.trendingQuery = ''
+      state.trendingRepos = []
+      fetchTrending()
+    }
   }
 
   // Kanban Event Handlers
@@ -3361,7 +3454,7 @@ function bindEvents() {
       const id = btn.dataset.taskId
       const task = state.kanbanTasks.find(t => t.id === id)
       if (task) {
-        const statusOrder = ['backlog', 'todo', 'in_progress', 'done']
+        const statusOrder = ['backlog', 'todo', 'in_progress', 'review', 'done']
         const currentIndex = statusOrder.indexOf(task.status)
         if (currentIndex > 0) {
           task.status = statusOrder[currentIndex - 1]
@@ -3379,7 +3472,7 @@ function bindEvents() {
       const id = btn.dataset.taskId
       const task = state.kanbanTasks.find(t => t.id === id)
       if (task) {
-        const statusOrder = ['backlog', 'todo', 'in_progress', 'done']
+        const statusOrder = ['backlog', 'todo', 'in_progress', 'review', 'done']
         const currentIndex = statusOrder.indexOf(task.status)
         if (currentIndex < statusOrder.length - 1) {
           task.status = statusOrder[currentIndex + 1]
@@ -4452,6 +4545,80 @@ async function fetchTrending() {
     state.loadingTrending = false
     render()
   }
+}
+
+async function searchGitHubTrending(query) {
+  if (state.loadingTrending) return
+  state.loadingTrending = true
+  state.trendingIsSearchResult = true
+  state.trendingQuery = query
+  render()
+  try {
+    state.trendingRepos = await github.searchRepos(query)
+  } catch (err) {
+    console.error(err)
+    Toast.show('Failed to search repositories: ' + err.message, 'error')
+  } finally {
+    state.loadingTrending = false
+    render()
+  }
+}
+
+function renderTrendingListOnly() {
+  const trendingListContainer = document.querySelector('#trending-repo-list')
+  if (!trendingListContainer) return
+
+  const query = (state.trendingQuery || '').toLowerCase().trim()
+  const displayRepos = state.trendingRepos.filter(repo => {
+    return repo.name.toLowerCase().includes(query) || 
+           repo.author.toLowerCase().includes(query) || 
+           (repo.description || '').toLowerCase().includes(query) ||
+           (repo.language || '').toLowerCase().includes(query)
+  })
+
+  const periodText = state.trendingTimeframe === 'daily' ? 'today' : (state.trendingTimeframe === 'weekly' ? 'this week' : 'this month')
+
+  if (displayRepos.length === 0) {
+    trendingListContainer.innerHTML = `
+      <div class="empty-state">
+        <i data-lucide="trending-up" class="empty-state-icon"></i>
+        <h3>No Repositories Found</h3>
+        <p>No results match "${state.trendingQuery}". Click "Search GitHub" or press Enter to query GitHub globally.</p>
+      </div>
+    `
+  } else {
+    trendingListContainer.innerHTML = displayRepos.map((repo, index) => {
+      return `
+        <div class="list-item" style="align-items:flex-start;padding:1rem 1.25rem;">
+          <div style="width:28px;height:28px;display:flex;align-items:center;justify-content:center;font-family:var(--font-mono);font-size:0.75rem;font-weight:700;color:var(--text-muted);flex-shrink:0;">
+            #${index + 1}
+          </div>
+          <div class="list-item-body">
+            <div style="display:flex;align-items:center;gap:0.5rem;margin-bottom:0.35rem;flex-wrap:wrap;">
+              <a href="${repo.html_url}" target="_blank" class="list-item-title">
+                <span style="color:var(--text-muted);font-weight:400;">${repo.author} / </span>${repo.name}
+              </a>
+              ${repo.language ? `<span class="badge badge-pill badge-muted" style="display:flex;align-items:center;gap:4px;"><span class="lang-dot" style="background:${repo.languageColor || getLangColor(repo.language)};margin-right:0;"></span>${repo.language}</span>` : ''}
+            </div>
+            <p style="font-size:0.85rem;color:var(--text-secondary);line-height:1.5;margin-bottom:0.5rem;max-width:700px;">${repo.description || 'No description provided.'}</p>
+            <div class="list-item-meta">
+              <span class="list-item-meta-unit" title="Stars"><i data-lucide="star"></i> ${repo.stargazers_count.toLocaleString()}</span>
+              <span class="list-item-meta-unit" title="Forks"><i data-lucide="git-fork"></i> ${repo.forks_count.toLocaleString()}</span>
+              ${repo.currentPeriodStars ? `<span class="list-item-meta-unit" style="color:var(--warning);"><i data-lucide="trending-up"></i> +${repo.currentPeriodStars.toLocaleString()} ${periodText}</span>` : ''}
+              ${repo.builtBy && repo.builtBy.length > 0 ? `
+                <span class="list-item-meta-unit">Built by
+                  ${repo.builtBy.map(u => `<a href="${u.href}" target="_blank" title="${u.username}"><img src="${u.avatar}" style="width:18px;height:18px;border-radius:50%;vertical-align:middle;margin-left:2px;"/></a>`).join('')}
+                </span>` : ''}
+            </div>
+          </div>
+          <a href="${repo.html_url}" target="_blank" class="btn btn-ghost btn-sm" style="flex-shrink:0;">
+            <i data-lucide="external-link"></i>
+          </a>
+        </div>
+      `
+    }).join('')
+  }
+  lucide.createIcons()
 }
 
 async function fetchAllCfZones() {
